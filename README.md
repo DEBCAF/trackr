@@ -40,6 +40,13 @@ Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/bui
 1. Create your account in Supabase Authentication with email and password.
 2. Run `supabase/transactions_rls.sql` in the Supabase SQL Editor.
 3. Backfill existing transactions by replacing the email in the commented query in that SQL file with your account email, then run the query.
-4. Set `TRACKR_OWNER_ID` to your Auth user UUID in `.env.local` and in Vercel. Find the UUID in Supabase Authentication under Users.
+4. Run `supabase/allowance.sql` in the Supabase SQL Editor.
+5. Set `TRACKR_OWNER_ID` (your Auth user UUID, from Supabase Authentication → Users) and `CRON_SECRET` in `.env.local` and in Vercel.
 
-The dashboard and transaction API require a signed-in account. Row-level security limits transaction access to that account. The allowance cron uses `TRACKR_OWNER_ID` to add a £40 morning allowance daily at 08:00 UTC. The dashboard's daily allowance metric shows £40 minus expenses recorded today.
+The dashboard and transaction API require a signed-in account. Row-level security limits transaction access to that account.
+
+### Daily allowance
+
+The `ensure_allowance` database function adds £40 (`allowance_settings.daily_amount`) to the balance for every UK calendar day that doesn't have one yet, up to today. It runs whenever the dashboard loads, and the Vercel cron (`/api/cron/allowance`, just after midnight UTC) calls it as a backup. A unique index allows only one allowance per day, so repeated runs never double-add, and a missed day is caught up on the next run.
+
+The **Pause daily allowance** button on the dashboard stops new days being added. **Resume** starts again from today; paused days are never back-filled. "Today's Allowance Remaining" is today's allowance minus today's expenses. Manual top-ups change the balance but not this number.

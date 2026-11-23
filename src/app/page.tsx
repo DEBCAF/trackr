@@ -10,6 +10,46 @@ interface Transaction {
   amount: number
   category: string
   type: 'allowance' | 'expense' | 'manual'
+  allowance_date: string | null
+}
+
+interface AllowanceSettings {
+  paused: boolean
+  daily_amount: number
+}
+
+// Calendar day (YYYY-MM-DD) in UK time, matching the database's ensure_allowance.
+const londonDay = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Europe/London',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+})
+function toLondonDate(date: Date | string) {
+  return londonDay.format(typeof date === 'string' ? new Date(date) : date)
+}
+
+// Add any missing days' allowance (idempotent, done in the database), then load
+// transactions and allowance settings.
+async function loadDashboardData() {
+  const supabase = createClient()
+  const ensure = await supabase.rpc('ensure_allowance')
+  const [txResult, settingsResult] = await Promise.all([
+    supabase.from('transactions').select('*').order('created_at', { ascending: false }),
+    supabase.from('allowance_settings').select('paused, daily_amount').maybeSingle(),
+  ])
+
+  const error =
+    txResult.error?.message ??
+    (ensure.error && `Could not add daily allowance: ${ensure.error.message}`) ??
+    settingsResult.error?.message ??
+    ''
+
+  return {
+    error,
+    transactions: (txResult.data as Transaction[] | null) ?? null,
+    settings: (settingsResult.data as AllowanceSettings | null) ?? null,
+  }
 }
 
 export default function BudgetDashboard() {
@@ -25,6 +65,8 @@ export default function BudgetDashboard() {
   const [amount, setAmount] = useState('')
   const [transType, setTransType] = useState<'expense' | 'manual'>('expense')
   const [saveError, setSaveError] = useState('')
+  const [settings, setSettings] = useState<AllowanceSettings | null>(null)
+  const [isTogglingPause, setIsTogglingPause] = useState(false)
 
   useEffect(() => {
     const supabase = createClient()
@@ -49,26 +91,47 @@ export default function BudgetDashboard() {
     }
   }, [])
 
+  // Bump to reload the dashboard (after saving, deleting, pausing, or returning to the tab).
+  const [reloadKey, setReloadKey] = useState(0)
+  const reload = () => setReloadKey((k) => k + 1)
+
+  const userId = user?.id
   useEffect(() => {
-    if (user) {
-      fetchTransactions()
+    if (!userId) return
+    let active = true
+
+    loadDashboardData().then((result) => {
+      if (!active) return
+      setLoadError(result.error)
+      if (result.transactions) setTransactions(result.transactions)
+      setSettings(result.settings)
+    })
+
+    return () => {
+      active = false
     }
-  }, [user])
+  }, [userId, reloadKey])
 
-  async function fetchTransactions() {
-    const supabase = createClient()
-    const { data, error } = await supabase
-      .from('transactions')
-      .select('*')
-      .order('created_at', { ascending: false })
+  // Pick up a new day's allowance when you come back to the tab.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') setReloadKey((k) => k + 1)
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [])
 
+  async function handleTogglePause() {
+    if (!settings) return
+    setIsTogglingPause(true)
+    const { error } = await createClient().rpc('set_allowance_paused', { p_paused: !settings.paused })
+    setIsTogglingPause(false)
     if (error) {
       setLoadError(error.message)
       return
     }
-
-    setLoadError('')
-    if (data) setTransactions(data)
+    // Reloading runs ensure_allowance, so resuming adds today's allowance straight away.
+    reload()
   }
 
   async function handleSignIn(e: React.FormEvent) {
@@ -125,7 +188,7 @@ export default function BudgetDashboard() {
 
       setTitle('')
       setAmount('')
-      await fetchTransactions()
+      reload()
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : 'Could not save transaction.')
     }
@@ -138,7 +201,7 @@ export default function BudgetDashboard() {
       setLoadError(error.message)
       return
     }
-    await fetchTransactions()
+    reload()
   }
 
   if (!authReady) {
@@ -186,12 +249,17 @@ export default function BudgetDashboard() {
   // Calculate Central Balance
   const currentBalance = transactions.reduce((acc, curr) => acc + Number(curr.amount), 0)
 
-  // Summary Metrics
-  const todayStr = new Date().toISOString().split('T')[0]
+  // Today's allowance remaining = allowance actually received today - today's expenses.
+  // Top-ups change the balance only, not today's allowance.
+  const today = toLondonDate(new Date())
+  const allowanceToday = transactions
+    .filter((t) => t.type === 'allowance' && (t.allowance_date ?? toLondonDate(t.created_at)) === today)
+    .reduce((acc, curr) => acc + Number(curr.amount), 0)
   const totalSpentToday = transactions
-    .filter((t) => t.type === 'expense' && t.created_at.startsWith(todayStr))
+    .filter((t) => t.type === 'expense' && toLondonDate(t.created_at) === today)
     .reduce((acc, curr) => acc + Math.abs(Number(curr.amount)), 0)
-  const dailyNet = 40 - totalSpentToday
+  const dailyNet = allowanceToday - totalSpentToday
+  const dailyAmount = Number(settings?.daily_amount ?? 40)
 
   return (
     <main className="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 p-6">
@@ -217,11 +285,27 @@ export default function BudgetDashboard() {
 
         {/* Summary Metric Cards */}
         <div>
-          <div className="bg-white dark:bg-gray-800 p-5 rounded-xl border shadow-sm">
-            <p className="text-sm text-gray-500">Today&apos;s Allowance Remaining</p>
-            <p className={`text-2xl font-bold ${dailyNet >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
-              £{dailyNet.toFixed(2)}
-            </p>
+          <div className="bg-white dark:bg-gray-800 p-5 rounded-xl border shadow-sm flex items-center justify-between gap-4">
+            <div>
+              <p className="text-sm text-gray-500">Today&apos;s Allowance Remaining</p>
+              <p className={`text-2xl font-bold ${dailyNet >= 0 ? 'text-emerald-500' : 'text-rose-500'}`}>
+                £{dailyNet.toFixed(2)}
+              </p>
+              <p className="text-xs text-gray-500 mt-1">
+                {settings?.paused
+                  ? `Daily £${dailyAmount.toFixed(2)} is paused`
+                  : `£${dailyAmount.toFixed(2)} is added to your balance each day`}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={handleTogglePause}
+              disabled={!settings || isTogglingPause}
+              aria-pressed={settings?.paused ?? false}
+              className="shrink-0 text-sm border dark:border-gray-700 px-3 py-2 rounded hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-60"
+            >
+              {settings?.paused ? 'Resume daily allowance' : 'Pause daily allowance'}
+            </button>
           </div>
         </div>
 

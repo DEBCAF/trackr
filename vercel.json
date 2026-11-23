@@ -1,8 +1,8 @@
 {
   "crons": [
     {
-      "path": "/api/cron/allowance?slot=morning",
-      "schedule": "0 8 * * *"
+      "path": "/api/cron/allowance",
+      "schedule": "5 0 * * *"
     }
   ]
 }
